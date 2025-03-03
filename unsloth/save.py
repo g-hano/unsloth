@@ -1270,6 +1270,439 @@ def save_to_gguf(
     return all_saved_locations, full_precision_seen
 pass
 
+#! -------------------------------------------------------------------------
+def save_to_gguf_vision(
+    model_type           : str,
+    model_dtype          : str,
+    is_sentencepiece     : bool = False,
+    model_directory      : str = "unsloth_finetuned_model",
+    quantization_method  = "fast_quantized",
+    first_conversion     : str = None,
+    vision_config        = None,
+    _run_installer = None,
+):
+    """
+    Extends save_to_gguf with vision model support.
+    
+    Args:
+        model_type: The type of model (e.g., "llama")
+        model_dtype: Data type of the model ("float16" or "bfloat16")
+        is_sentencepiece: Whether the model uses sentencepiece tokenization
+        model_directory: Directory where the model is saved
+        quantization_method: Method used for quantization
+        first_conversion: Initial format for conversion
+        vision_config: Configuration for vision components
+        _run_installer: For non-blocking install of llama.cpp
+    
+    Returns:
+        Tuple containing file locations and whether full precision is wanted
+    """
+    # Process vision-specific information
+    vision_model_type = getattr(vision_config, "model_type", model_type)
+    processor_config = getattr(vision_config, "processor_config", {})
+    
+    # Call the base GGUF conversion with vision-specific parameters
+    all_file_locations, want_full_precision = save_to_gguf(
+        model_type, model_dtype, is_sentencepiece,
+        model_directory, quantization_method, first_conversion, _run_installer,
+    )
+    
+    # Handle vision-specific model metadata
+    for file_location in all_file_locations:
+        # Add vision config to GGUF metadata
+        add_vision_metadata_to_gguf(file_location, vision_config)
+    
+    return all_file_locations, want_full_precision
+
+def add_vision_metadata_to_gguf(gguf_file, vision_config):
+    """
+    Adds vision-specific metadata to accompany a GGUF file.
+    This creates a separate JSON file with vision processing information.
+    
+    Args:
+        gguf_file: Path to the GGUF file
+        vision_config: Vision model configuration
+    """
+    import json
+    
+    # Extract relevant vision configuration
+    vision_metadata = {
+        "vision_tower": getattr(vision_config, "vision_tower", None),
+        "image_size": getattr(vision_config, "image_size", 336),
+        "patch_size": getattr(vision_config, "patch_size", 14),
+        "num_channels": getattr(vision_config, "num_channels", 3),
+        "model_type": getattr(vision_config, "model_type", "llama"),
+        "processor_class": getattr(vision_config, "processor_class", None),
+        "vision_config_dict": getattr(vision_config, "vision_config", {}),
+    }
+    
+    # Save as companion file
+    vision_config_path = gguf_file + ".vision_config.json"
+    with open(vision_config_path, "w") as f:
+        json.dump(vision_metadata, f, indent=2)
+    
+    logger.info(f"Unsloth: Saved vision configuration to {vision_config_path}")
+    return vision_config_path
+
+def unsloth_save_pretrained_gguf_vision(
+    self,
+    save_directory       : Union[str, os.PathLike],
+    tokenizer            = None,
+    quantization_method  : str = "fast_quantized",
+    first_conversion     : str = None,
+    push_to_hub          : bool = False,
+    token                : Optional[Union[str, bool]] = None,
+    private              : Optional[bool] = None,
+    is_main_process      : bool = True,
+    state_dict           : Optional[dict] = None,
+    save_function        : Callable = torch.save,
+    max_shard_size       : Union[int, str] = "5GB",
+    safe_serialization   : bool = True,
+    variant              : Optional[str] = None,
+    save_peft_format     : bool = True,
+    tags                 : List[str] = None,
+    temporary_location   : str = "_unsloth_temporary_saved_buffers",
+    maximum_memory_usage : float = 0.85,
+):
+    """
+    Save a vision-language model to GGUF format.
+    
+    This function extends Unsloth's GGUF support to vision-language models by:
+    1. Saving the model in merged format
+    2. Converting to GGUF format
+    3. Adding vision-specific metadata
+    4. Optionally pushing to Hugging Face Hub
+    
+    Args:
+        save_directory: Directory or repo name to save the model
+        tokenizer: The tokenizer/processor to save alongside the model
+        quantization_method: Method used for quantization
+        first_conversion: Initial format for conversion
+        push_to_hub: Whether to push the model to Hugging Face Hub
+        token: Hugging Face API token
+        And other standard model saving parameters
+        
+    Returns:
+        List of paths to the saved GGUF files
+    """
+    if tokenizer is None:
+        raise ValueError("Unsloth: Saving to GGUF must have a processor/tokenizer.")
+
+    # Log that we're converting a vision model
+    logger.warning(
+        "Unsloth: Converting a vision-language model to GGUF format.\n"
+        "Note that only the language model part will be fully compatible with llama.cpp.\n"
+        "Vision preprocessing will need to be handled separately using the saved vision configuration."
+    )
+
+    # Regular arguments for unsloth_save_model
+    arguments = dict(locals())
+    arguments["model"]        = self
+    arguments["tokenizer"]    = tokenizer
+    arguments["push_to_hub"]  = False  # We'll handle pushing separately
+    arguments["save_method"]  = "merged_16bit"  # Must be 16bit for GGUF conversion
+    del arguments["self"]
+    del arguments["quantization_method"]
+    del arguments["first_conversion"]
+
+    # Fix tokenizer adding an extra BOS token at the front
+    fix_bos_token, old_chat_template = fix_tokenizer_bos_token(tokenizer)
+    
+    # Non blocking install GGUF first
+    if not os.path.exists("llama.cpp"):
+        if IS_KAGGLE_ENVIRONMENT:
+            # Kaggle is weird - no blocking installs, and no CUDA?
+            python_install = install_python_non_blocking(["gguf", "protobuf"])
+            python_install.wait()
+            install_llama_cpp_blocking(use_cuda = False)
+            new_save_directory, old_username = unsloth_save_model(**arguments)
+            makefile = None
+        else:
+            git_clone = install_llama_cpp_clone_non_blocking()
+            python_install = install_python_non_blocking(["gguf", "protobuf"])
+            git_clone.wait()
+            makefile = install_llama_cpp_make_non_blocking()
+            new_save_directory, old_username = unsloth_save_model(**arguments)
+            python_install.wait()
+        pass
+    else:
+        try:
+            new_save_directory, old_username = unsloth_save_model(**arguments)
+            makefile = None
+        except:
+            # Retry by recloning llama.cpp
+            if IS_KAGGLE_ENVIRONMENT:
+                python_install = install_python_non_blocking(["gguf", "protobuf"])
+                python_install.wait()
+                install_llama_cpp_blocking(use_cuda = False)
+                new_save_directory, old_username = unsloth_save_model(**arguments)
+                makefile = None
+            else:
+                git_clone = install_llama_cpp_clone_non_blocking()
+                python_install = install_python_non_blocking(["gguf", "protobuf"])
+                git_clone.wait()
+                makefile = install_llama_cpp_make_non_blocking()
+                new_save_directory, old_username = unsloth_save_model(**arguments)
+                python_install.wait()
+            pass
+        pass
+    pass
+
+    # Use old chat template if the bos is removed
+    if fix_bos_token:
+        tokenizer.chat_template = old_chat_template
+    pass
+
+    for _ in range(3):
+        gc.collect()
+
+    model_dtype = self.config.torch_dtype
+    model_type  = self.config.model_type
+    if type(model_dtype) is str:
+        assert(model_dtype == "float16" or model_dtype == "bfloat16")
+    elif model_dtype == torch.float16:
+        model_dtype = "float16"
+    elif model_dtype == torch.bfloat16:
+        model_dtype = "bfloat16"
+    else:
+        raise TypeError("Unsloth: Model dtype can only be float16 or bfloat16")
+    pass
+
+    is_sentencepiece_model = check_if_sentencepiece_model(self)
+
+    # Save to GGUF using the standard function
+    all_file_locations, want_full_precision = save_to_gguf(
+        model_type, model_dtype, is_sentencepiece_model,
+        new_save_directory, quantization_method, first_conversion, makefile,
+    )
+    
+    # Add vision metadata to all GGUF files
+    vision_metadata_files = []
+    for file_location in all_file_locations:
+        vision_metadata_path = add_vision_metadata_to_gguf(file_location, self.config)
+        vision_metadata_files.append(vision_metadata_path)
+
+    # Save Ollama modelfile
+    modelfile = create_ollama_modelfile(tokenizer, all_file_locations[0])
+    modelfile_location = None
+    if modelfile is not None:
+        modelfile_location = os.path.join(new_save_directory, "Modelfile")
+        with open(modelfile_location, "w") as file:
+            file.write(modelfile)
+        pass
+        print(f"Unsloth: Saved Ollama Modelfile to {modelfile_location}")
+    pass
+
+    if fix_bos_token:
+        logger.warning(
+            "Unsloth: ##### The current model auto adds a BOS token.\n"\
+            "Unsloth: ##### We removed it in GGUF's chat template for you."
+        )
+    pass
+
+    if push_to_hub:
+        print("Unsloth: Uploading Vision-GGUF model to Hugging Face Hub...")
+
+        # If not needing full precision, skip the first
+        if not want_full_precision: 
+            all_file_locations = all_file_locations[1:]
+            vision_metadata_files = vision_metadata_files[1:]
+
+        for file_location, metadata_file in zip(all_file_locations, vision_metadata_files):
+            # Upload the GGUF file
+            username = upload_to_huggingface(
+                self, save_directory, token,
+                "GGUF Vision model", "gguf-vision", file_location, old_username, private,
+            )
+            link = f"{username}/{new_save_directory.lstrip('/.')}" \
+                if username not in new_save_directory else \
+                new_save_directory.lstrip('/.')
+            print(f"Saved GGUF Vision model to https://huggingface.co/{link}")
+            
+            # Upload the vision metadata file
+            username = upload_to_huggingface(
+                self, save_directory, token,
+                "GGUF Vision model", "gguf-vision", metadata_file, old_username, private,
+                create_config=False
+            )
+
+        # Save modelfile
+        if modelfile_location is not None:
+            username = upload_to_huggingface(
+                self, save_directory, token,
+                "GGUF vision model", "gguf-vision", modelfile_location, old_username, private,
+                create_config=False
+            )
+            print(f"Saved Ollama Modelfile to https://huggingface.co/{link}")
+        pass
+    pass
+
+    return all_file_locations
+
+def unsloth_push_to_hub_gguf_vision(
+    self,
+    repo_id              : str,
+    tokenizer            = None,
+    quantization_method  : str = "fast_quantized",
+    first_conversion     : str = None,
+    use_temp_dir         : Optional[bool] = None,
+    commit_message       : Optional[str] = "Trained with Unsloth",
+    private              : Optional[bool] = None,
+    token                : Union[bool, str, None] = None,
+    max_shard_size       : Union[int, str, None] = "5GB",
+    create_pr            : bool = False,
+    safe_serialization   : bool = True,
+    revision             : str = None,
+    commit_description   : str = "Upload vision model trained with Unsloth 2x faster",
+    tags                 : Optional[List[str]] = None,
+    temporary_location   : str = "_unsloth_temporary_saved_buffers",
+    maximum_memory_usage : float = 0.85,
+):
+    """
+    Push a vision-language model to Hugging Face Hub in GGUF format.
+    
+    This function simply wraps unsloth_save_pretrained_gguf_vision with push_to_hub=True
+    
+    Args:
+        repo_id: Repository ID on Hugging Face Hub
+        tokenizer: The tokenizer/processor to save with the model
+        quantization_method: Method used for quantization
+        first_conversion: Initial format for conversion
+        And other standard push_to_hub parameters
+        
+    Returns:
+        List of paths to saved GGUF files
+    """
+    if tokenizer is None:
+        raise ValueError("Unsloth: Saving to GGUF must have a processor/tokenizer.")
+
+    arguments = dict(locals())
+    arguments["model"]          = self
+    arguments["tokenizer"]      = tokenizer
+    arguments["save_directory"] = repo_id
+    arguments["push_to_hub"]    = True  # We do want to push to hub
+    del arguments["self"]
+    del arguments["repo_id"]
+
+    # Add vision-specific tags
+    if tags is None:
+        arguments["tags"] = ["unsloth", "vision", "gguf", "multimodal"]
+    else:
+        if isinstance(tags, (list, tuple)):
+            arguments["tags"] = list(tags) + ["unsloth", "vision", "gguf", "multimodal"]
+        else:
+            arguments["tags"] = ["unsloth", "vision", "gguf", "multimodal"]
+
+    return unsloth_save_pretrained_gguf_vision(**arguments)
+
+def patch_saving_functions_vision(model, vision = False):
+    import inspect
+    import types
+    from typing import Callable, Optional, Union, List
+
+    # And now re add our saving methods!
+    if model.push_to_hub.__name__ == "unsloth_push_to_hub":
+        original_push_to_hub = model.original_push_to_hub
+    else:
+        original_push_to_hub = model.push_to_hub
+    pass
+
+    signature = str(inspect.signature(original_push_to_hub)).replace("NoneType", "None")
+    signature = signature[1:]
+    signature = re.sub("<function save at .+?>", "torch.save", signature)
+    docs = original_push_to_hub.__doc__.encode("utf-8").decode("utf-8")
+
+    push_to_hub_text = f'''def unsloth_push_to_hub(self, {signature}:
+    """
+    {docs}
+    """
+    arguments = dict(locals())
+    del arguments["self"]
+    if "tags" in arguments and arguments["tags"] is not None:
+        assert(isinstance(arguments["tags"], (list, tuple)))
+        arguments["tags"] = list(arguments["tags"]) + ["unsloth",]
+    elif "tags" in arguments:
+        arguments["tags"] = ["unsloth",]
+    elif hasattr(self, "add_model_tags"):
+        self.add_model_tags(["unsloth",])
+
+    if "commit_message" in arguments:
+        commit_message = arguments["commit_message"]
+        if commit_message is not None:
+            if not commit_message.endswith(" "): commit_message += " "
+            if "Unsloth" not in commit_message:
+                commit_message += "(Trained with Unsloth)"
+        else:
+            commit_message = "Upload model trained with Unsloth"
+        arguments["commit_message"] = commit_message
+
+    if "commit_description" in arguments:
+        commit_description = arguments["commit_description"]
+        if commit_description is not None:
+            if not commit_description.endswith(" "): commit_description += " "
+            if "Unsloth" not in commit_description:
+                commit_description += "(Trained with Unsloth 2x faster)"
+        else:
+            commit_description = "Upload model trained with Unsloth 2x faster"
+        arguments["commit_description"] = commit_description
+
+    # Update model tag
+    if hasattr(self, "config"):
+        _ = upload_to_huggingface(
+            self, arguments["repo_id"], arguments["token"],
+            "finetuned", "trl", file_location = None,
+            old_username = None, private = arguments["private"],
+        )
+    pass
+
+    try:
+        self.original_push_to_hub(**arguments)
+    except:
+        del arguments["tags"]
+        self.original_push_to_hub(**arguments)
+    pass
+
+    if hasattr(self, "config"):
+        print("Saved model to https://huggingface.co/" + arguments["repo_id"])
+    pass
+    '''
+    exec(push_to_hub_text, globals())
+
+    original_model = model
+    while True:
+
+        if original_model.push_to_hub.__name__ != "unsloth_push_to_hub":
+            original_model.original_push_to_hub = original_model.push_to_hub
+            original_model.push_to_hub = types.MethodType(unsloth_push_to_hub, original_model)
+            if hasattr(original_model, "add_model_tags"):
+                original_model.add_model_tags(["unsloth",])
+            pass
+        pass
+
+        if hasattr(original_model, "model"): original_model = original_model.model
+        else: break
+    pass
+
+    # Add saving methods to top level model
+    if not vision:
+        if hasattr(model, "config"):
+            # Counteract tokenizers
+            model.push_to_hub_merged     = types.MethodType(unsloth_push_to_hub_merged,                    model)
+            model.save_pretrained_merged = types.MethodType(unsloth_save_pretrained_merged,                model)
+            model.push_to_hub_gguf       = types.MethodType(unsloth_push_to_hub_gguf,                      model)
+            model.save_pretrained_gguf   = types.MethodType(unsloth_save_pretrained_gguf,                  model)
+            model.push_to_hub_ggml       = types.MethodType(unsloth_convert_lora_to_ggml_and_push_to_hub,  model)
+            model.save_pretrained_ggml   = types.MethodType(unsloth_convert_lora_to_ggml_and_save_locally, model)
+        pass
+    else:
+        # Vision now has GGUF support
+        model.push_to_hub_merged     = types.MethodType(unsloth_generic_push_to_hub_merged,     model)
+        model.save_pretrained_merged = types.MethodType(unsloth_generic_save_pretrained_merged, model)
+        model.push_to_hub_gguf       = types.MethodType(unsloth_push_to_hub_gguf_vision,        model)
+        model.save_pretrained_gguf   = types.MethodType(unsloth_save_pretrained_gguf_vision,    model)
+    pass
+    return model
+#! -------------------------------------------------------------------------
 
 def unsloth_save_pretrained_merged(
     self,

@@ -1317,24 +1317,35 @@ def save_to_gguf_vision(
 def add_vision_metadata_to_gguf(gguf_file, vision_config):
     """
     Adds vision-specific metadata to accompany a GGUF file.
-    This creates a separate JSON file with vision processing information.
+    Creates a JSON file with vision processing information.
     
     Args:
         gguf_file: Path to the GGUF file
         vision_config: Vision model configuration
+    
+    Returns:
+        Path to the saved vision config file
     """
     import json
     
     # Extract relevant vision configuration
     vision_metadata = {
+        "model_type": getattr(vision_config, "model_type", "llama"),
         "vision_tower": getattr(vision_config, "vision_tower", None),
         "image_size": getattr(vision_config, "image_size", 336),
         "patch_size": getattr(vision_config, "patch_size", 14),
         "num_channels": getattr(vision_config, "num_channels", 3),
-        "model_type": getattr(vision_config, "model_type", "llama"),
-        "processor_class": getattr(vision_config, "processor_class", None),
-        "vision_config_dict": getattr(vision_config, "vision_config", {}),
     }
+    
+    # Add additional vision-specific attributes if they exist
+    for attr in ["vision_config", "processor_class", "vision_feature_layer", 
+                 "vision_feature_select_strategy", "image_token_index"]:
+        if hasattr(vision_config, attr):
+            value = getattr(vision_config, attr)
+            # Convert some complex objects to strings or basic types
+            if hasattr(value, "__dict__"):
+                value = str(value)
+            vision_metadata[attr] = value
     
     # Save as companion file
     vision_config_path = gguf_file + ".vision_config.json"
@@ -1372,18 +1383,6 @@ def unsloth_save_pretrained_gguf_vision(
     2. Converting to GGUF format
     3. Adding vision-specific metadata
     4. Optionally pushing to Hugging Face Hub
-    
-    Args:
-        save_directory: Directory or repo name to save the model
-        tokenizer: The tokenizer/processor to save alongside the model
-        quantization_method: Method used for quantization
-        first_conversion: Initial format for conversion
-        push_to_hub: Whether to push the model to Hugging Face Hub
-        token: Hugging Face API token
-        And other standard model saving parameters
-        
-    Returns:
-        List of paths to the saved GGUF files
     """
     if tokenizer is None:
         raise ValueError("Unsloth: Saving to GGUF must have a processor/tokenizer.")
@@ -1405,8 +1404,8 @@ def unsloth_save_pretrained_gguf_vision(
     del arguments["quantization_method"]
     del arguments["first_conversion"]
 
-    # Fix tokenizer adding an extra BOS token at the front
-    fix_bos_token, old_chat_template = fix_tokenizer_bos_token(tokenizer)
+    # Skip BOS token check for vision models as it requires different handling
+    fix_bos_token, old_chat_template = False, None
     
     # Non blocking install GGUF first
     if not os.path.exists("llama.cpp"):
@@ -1449,7 +1448,7 @@ def unsloth_save_pretrained_gguf_vision(
     pass
 
     # Use old chat template if the bos is removed
-    if fix_bos_token:
+    if fix_bos_token and old_chat_template is not None:
         tokenizer.chat_template = old_chat_template
     pass
 
@@ -1482,8 +1481,14 @@ def unsloth_save_pretrained_gguf_vision(
         vision_metadata_path = add_vision_metadata_to_gguf(file_location, self.config)
         vision_metadata_files.append(vision_metadata_path)
 
-    # Save Ollama modelfile
-    modelfile = create_ollama_modelfile(tokenizer, all_file_locations[0])
+    # Save Ollama modelfile if applicable
+    modelfile = None
+    try:
+        modelfile = create_ollama_modelfile(tokenizer, all_file_locations[0])
+    except (AttributeError, TypeError):
+        logger.warning("Unsloth: Unable to create Ollama modelfile for vision model.")
+        pass
+
     modelfile_location = None
     if modelfile is not None:
         modelfile_location = os.path.join(new_save_directory, "Modelfile")
@@ -1491,13 +1496,6 @@ def unsloth_save_pretrained_gguf_vision(
             file.write(modelfile)
         pass
         print(f"Unsloth: Saved Ollama Modelfile to {modelfile_location}")
-    pass
-
-    if fix_bos_token:
-        logger.warning(
-            "Unsloth: ##### The current model auto adds a BOS token.\n"\
-            "Unsloth: ##### We removed it in GGUF's chat template for you."
-        )
     pass
 
     if push_to_hub:
@@ -1970,33 +1968,48 @@ pass
 
 
 def fix_tokenizer_bos_token(tokenizer):
-    # Check if BOS added already, then warn
+    """
+    Fixes an issue where some tokenizers add an extra BOS token at the front.
+    Modified to handle vision processors.
+    """
+    # Check if we're dealing with a vision processor
+    is_vision_processor = hasattr(tokenizer, "image_processor") or "VL" in tokenizer.__class__.__name__
+
+    # Default values
     fix_bos_token = False
     chat_template = getattr(tokenizer, "chat_template", None)
 
-    if (tokenizer("A").input_ids[0] == getattr(tokenizer, "bos_token_id", None)):
-        if chat_template is not None and \
-            (
-                tokenizer.bos_token in chat_template or \
-                "{bos_token}" in chat_template.replace(" ", "") or \
-                "{bos_token+" in chat_template.replace(" ", "")
-            ):
+    if not is_vision_processor:
+        # Standard text tokenizer handling
+        try:
+            if (tokenizer("A").input_ids[0] == getattr(tokenizer, "bos_token_id", None)):
+                if chat_template is not None and \
+                    (
+                        tokenizer.bos_token in chat_template or \
+                        "{bos_token}" in chat_template.replace(" ", "") or \
+                        "{bos_token+" in chat_template.replace(" ", "")
+                    ):
+                    fix_bos_token = True
+                    logger.warning(
+                        "Unsloth: ##### The current model auto adds a BOS token.\n"\
+                        "Unsloth: ##### Your chat template has a BOS token. We shall remove it temporarily."
+                    )
 
-            fix_bos_token = True
-            logger.warning(
-                "Unsloth: ##### The current model auto adds a BOS token.\n"\
-                "Unsloth: ##### Your chat template has a BOS token. We shall remove it temporarily."
-            )
+                    # Remove {{bos_token}}
+                    new_chat_template = re.sub(r"\{[\s]{0,}\{[\s]{0,}bos\_token[\s]{0,}\}[\s]{0,}\}", "", chat_template)
+                    # Remove {{bos_token +
+                    new_chat_template = re.sub(r"\{[\s]{0,}\{[\s]{0,}bos\_token[\s]{0,}\+[\s]{0,}", "", new_chat_template)
 
-            # Remove {{bos_token}}
-            new_chat_template = re.sub(r"\{[\s]{0,}\{[\s]{0,}bos\_token[\s]{0,}\}[\s]{0,}\}", "", chat_template)
-            # Remove {{bos_token +
-            new_chat_template = re.sub(r"\{[\s]{0,}\{[\s]{0,}bos\_token[\s]{0,}\+[\s]{0,}", "", new_chat_template)
+                    tokenizer.chat_template = new_chat_template
+            pass
+        except (AttributeError, TypeError, ValueError) as e:
+            # Handle cases where tokenizer("A") fails (like for vision processors)
+            logger.warning(f"Unsloth: Could not check BOS token for tokenizer: {e}")
+            pass
+    else:
+        # For vision processors, we don't need to check for BOS tokens in the same way
+        logger.info("Unsloth: Detected vision processor. Skipping BOS token check.")
 
-            tokenizer.chat_template = new_chat_template
-
-        pass
-    pass
     return fix_bos_token, chat_template
 pass
 

@@ -110,22 +110,66 @@ pass
 
 
 def check_if_sentencepiece_model(model, temporary_location = "_unsloth_sentencepiece_temp"):
-    if not hasattr(model, "_saved_temp_tokenizer"): return False
+    """
+    Checks if a model uses SentencePiece tokenization.
+    Modified to handle vision processors.
+    """
+    if not hasattr(model, "_saved_temp_tokenizer"): 
+        return False
 
     temp_tokenizer = model._saved_temp_tokenizer
     sentencepiece_model = False
-    file_location = os.path.join(temporary_location, temp_tokenizer.name_or_path)
+    
+    # Check if this is a vision processor
+    is_vision_processor = hasattr(temp_tokenizer, "image_processor") or "VL" in temp_tokenizer.__class__.__name__
+    
+    if is_vision_processor:
+        # Vision processors don't use sentencepiece directly
+        # We need to check if the text tokenizer is sentencepiece-based
+        if hasattr(temp_tokenizer, "tokenizer"):
+            # Get the inner text tokenizer
+            text_tokenizer = temp_tokenizer.tokenizer
+            if hasattr(text_tokenizer, "name_or_path"):
+                # Use the text tokenizer's path for checking
+                tokenizer_path = text_tokenizer.name_or_path
+            else:
+                # No way to check, assume not sentencepiece
+                return False
+        else:
+            # No inner tokenizer, assume not sentencepiece
+            return False
+    elif hasattr(temp_tokenizer, "name_or_path"):
+        # Regular text tokenizer
+        tokenizer_path = temp_tokenizer.name_or_path
+    else:
+        # Unknown tokenizer type, assume not sentencepiece
+        return False
+    
+    # Now continue with the path we've determined
+    file_location = os.path.join(temporary_location, tokenizer_path)
     created_folder = False
+    
     if not os.path.exists(file_location):
         created_folder = True
-        os.makedirs(file_location)
-    pass
-    temp_tokenizer.save_pretrained(file_location)
-    if os.path.isfile(f"{file_location}/tokenizer.model"):
-        sentencepiece_model = True
-    pass
+        os.makedirs(file_location, exist_ok=True)
+    
+    try:
+        # For vision models, save the text tokenizer part if available
+        if is_vision_processor and hasattr(temp_tokenizer, "tokenizer"):
+            temp_tokenizer.tokenizer.save_pretrained(file_location)
+        else:
+            temp_tokenizer.save_pretrained(file_location)
+            
+        if os.path.isfile(f"{file_location}/tokenizer.model"):
+            sentencepiece_model = True
+    except (AttributeError, TypeError, ValueError, OSError) as e:
+        logger.warning(f"Unsloth: Error checking for sentencepiece model: {e}")
+        sentencepiece_model = False
+    
+    # Clean up temporary directory if we created it
     if created_folder:
         shutil.rmtree(file_location, ignore_errors = True)
+        
     return sentencepiece_model
 pass
 
@@ -1447,11 +1491,6 @@ def unsloth_save_pretrained_gguf_vision(
         pass
     pass
 
-    # Use old chat template if the bos is removed
-    if fix_bos_token and old_chat_template is not None:
-        tokenizer.chat_template = old_chat_template
-    pass
-
     for _ in range(3):
         gc.collect()
 
@@ -1467,13 +1506,24 @@ def unsloth_save_pretrained_gguf_vision(
         raise TypeError("Unsloth: Model dtype can only be float16 or bfloat16")
     pass
 
-    is_sentencepiece_model = check_if_sentencepiece_model(self)
+    # Check if sentencepiece with special handling for vision models
+    try:
+        is_sentencepiece_model = check_if_sentencepiece_model(self)
+    except (AttributeError, TypeError) as e:
+        logger.warning(f"Unsloth: Error checking for sentencepiece model in vision model: {e}")
+        logger.warning("Unsloth: Assuming model is not using sentencepiece tokenization.")
+        is_sentencepiece_model = False
 
     # Save to GGUF using the standard function
-    all_file_locations, want_full_precision = save_to_gguf(
-        model_type, model_dtype, is_sentencepiece_model,
-        new_save_directory, quantization_method, first_conversion, makefile,
-    )
+    try:
+        all_file_locations, want_full_precision = save_to_gguf(
+            model_type, model_dtype, is_sentencepiece_model,
+            new_save_directory, quantization_method, first_conversion, makefile,
+        )
+    except Exception as e:
+        logger.error(f"Unsloth: Error converting vision model to GGUF: {e}")
+        logger.error("Unsloth: Please note that not all vision models can be properly converted to GGUF format.")
+        raise RuntimeError(f"Vision model GGUF conversion failed: {e}")
     
     # Add vision metadata to all GGUF files
     vision_metadata_files = []
